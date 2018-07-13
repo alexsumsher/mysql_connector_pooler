@@ -48,6 +48,15 @@ class server_info:
             self.__dict__[n] = v
 
     @property
+    def con_string(self):
+        cmdstr = 'mysql -h %s -u %s -p%s' % (self.host, self.user, self.passwd)
+        if self.port:
+            cmdstr += ' -P %s' % self.port
+        if self.db:
+            cmdstr += ' -D %s' % self.db
+        return cmdstr
+
+    @property
     def info(self):
         return self.__dict__
 
@@ -420,6 +429,14 @@ class mdb_mysql(object):
         return self.conn.query_db('SELECT LAST_INSERT_ID();', one=True)
 
 
+class com_servers(object):
+    modes = ('rolling', 'weight')
+    max_count = 10
+
+    def __init__(self):
+        pass
+
+
 class com_con(object):
     length = 10
     dead_len = 30
@@ -694,6 +711,106 @@ class com_con(object):
             return rt
         else:
             raise RuntimeError('NO connection to take, with current finger=%s' % self.finger)
+
+class Qer(object):
+    sel_limit = 20
+    con_pool = None
+
+    @classmethod
+    def set_con_pool(cls, con_pool):
+        if hasattr(con, 'w') and con.w == 'pool':
+            cls.con_pool = con_pool
+        else:
+            raise ValueError('NOT A CON-POOL!')
+
+    def __init__(self, con=None):
+        if cls.__class__.con_pool:
+            self.con = cls.__class__.con_pool
+            return
+        assert con
+        if hasattr(con, 'w') and con.w == 'pool':
+            self.__class__.con_pool = con
+        self.con = con
+
+    def __filter_dict(self, orign_data, colns=None, onlyexists=False, defv=None, mode='dict'):
+        # check a input dict/request.args&form for required keys, and covert to string/dict.
+        defv = defv if isinstance(defv, dict) else {'defv': str(defv)} if defv is not None else {'defv': ''}
+        defv_defv = defv.get('defv', '')
+        outs = dict()
+        colns = colns if isinstance(colns, (list, tuple)) else colns.split(',') if isinstance(colns, str) else orign_data.keys()
+        real_colns = []
+        for _ in colns:
+            v = orign_data.get(_)
+            if v is None:
+                if onlyexists:
+                    continue
+                else:
+                    v = defv.get(_, defv_defv)
+            real_colns.append(_)
+            outs[_] = v if v.isdigit() else '"%s"' % v
+        if mode == 'dict':
+            return outs
+        elif mode == 'pstr':
+            vstr = ''
+            for _ in real_colns:
+                vstr += '%s=%s,' % (_, outs[_])
+            return vstr[:-1]
+        elif mode == '2str':
+            nstr = ''
+            vstr = ''
+            for _ in real_colns:
+                nstr += _ + ','
+                vstr += outs[_] + ','
+            return nstr[:-1],vstr[:-1]
+
+    def __dict2str(self, from_dict, array=None, mode=0):
+        if mode == 0:
+            vstr = ''
+            for _ in array if array else form_dict.iterkeys():
+                v = from_dict[_]
+                vstr += '%s=%s,' % (_, v if v.isdigit() else '"%s"' % v)
+            return vstr[:-1]
+        else:
+            nstr = ''
+            vstr = ''
+            for _ in array if array else form_dict.iterkeys():
+                v = from_dict[_]
+                nstr += _ + ','
+                vstr += '%s,' % v if v.isdigit() else '"%s",' % v
+            return nstr[:-1],vstr[:-1]
+
+    @staticmethod
+    def __dict_list_4json(datalist, fieldlist, one=False):
+        """[{key-1-1:val-1-1,key-1-2:val-1-2,...},{key-2-1:val-2-1,key-2-2:val-2-2,...}]"""
+        # datalist: (1,2,3...), ((1,2,3..), (4,5,6...),...)
+        if isinstance(fieldlist, str):
+            fieldlist = fieldlist.split(',')
+        if not datalist or not isinstance(fieldlist, (list,tuple)):
+            print 'not a correct input!'
+            return None
+        slen = len(fieldlist)
+        if not isinstance(datalist[0], tuple):
+            if one:
+                line_dict = dict()
+                for _ in xrange(slen):
+                    line_dict[fieldlist[_]] = datalist[_]
+                return line_dict
+            else:
+                datalist = [datalist]
+        if len(datalist[0]) != slen:
+            print 'data not match field: \n%s\n%s' % (str(datalist[0]), str(fieldlist))
+            return {}
+        out_list = list()
+        line_dict = dict()
+        for line in datalist:
+            c = 0
+            for x in fieldlist:
+                t = line[c] if isinstance(c, dict) else line[c].__dict__
+                line_dict[x] = t if isinstance(t, (unicode, str, int)) else str(t)
+                c += 1
+            out_list.append(line_dict)
+            line_dict = dict()
+        return out_list
 
 
 if __name__ == '__main__':
