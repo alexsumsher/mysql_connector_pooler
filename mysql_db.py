@@ -429,14 +429,6 @@ class mdb_mysql(object):
         return self.conn.query_db('SELECT LAST_INSERT_ID();', one=True)
 
 
-class com_servers(object):
-    modes = ('rolling', 'weight')
-    max_count = 10
-
-    def __init__(self):
-        pass
-
-
 class com_con(object):
     length = 10
     dead_len = 30
@@ -732,7 +724,8 @@ class Qer(object):
             self.__class__.con_pool = con
         self.con = con
 
-    def __filter_dict(self, orign_data, colns=None, onlyexists=False, defv=None, mode='dict'):
+    @staticmethod
+    def __filter_dict(orign_data, colns=None, onlyexists=False, defv=None, mode='dict'):
         # check a input dict/request.args&form for required keys, and covert to string/dict.
         defv = defv if isinstance(defv, dict) else {'defv': str(defv)} if defv is not None else {'defv': ''}
         defv_defv = defv.get('defv', '')
@@ -763,6 +756,7 @@ class Qer(object):
                 vstr += outs[_] + ','
             return nstr[:-1],vstr[:-1]
 
+    @staticmethod
     def __dict2str(self, from_dict, array=None, mode=0):
         if mode == 0:
             vstr = ''
