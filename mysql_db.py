@@ -706,23 +706,28 @@ class com_con(object):
 
 class Qer(object):
     sel_limit = 20
-    con_pool = None
+    _con_pool = None
 
     @classmethod
     def set_con_pool(cls, con_pool):
-        if hasattr(con, 'w') and con.w == 'pool':
-            cls.con_pool = con_pool
+        if hasattr(con_pool, 'w') and con_pool.w == 'pool':
+            cls.con_pool = cls._con_pool = con_pool
         else:
             raise ValueError('NOT A CON-POOL!')
 
+    # if set the __con_pool for Qer, then if there was not set con_pool for subclass, witch will point to Qer's
+    # for common usage, we should not use __con_pool but _con_pool
+    # if new instance with a con key_value, then set the class con_pool to it
+    def __new__(cls, *args, **kwargs):
+        if 'con' in kwargs and hasattr(kwargs['con'], 'w') and kwargs['con'].w == 'pool':
+            cls.con_pool = cls._con_pool = kwargs['con']
+        return super(Qer, cls).__new__(cls)
+
+    # a) class new_qer_1(Qer), ins_of_new_qer_1() => ins_of_new_qer_1/new_qer_1 ._con_pool == Qer._con_pool
+    # b) class new_qer_2(Qer), ins_of_new_qer_2(con=new_con_pool) => ins_of_new_qer_2/new_qer_2 ._con_pool == new_con_pool
+    # remark: __init__ with self.con = self.__class__._con_pool for quit using con
     def __init__(self, con=None):
-        if cls.__class__.con_pool:
-            self.con = cls.__class__.con_pool
-            return
-        assert con
-        if hasattr(con, 'w') and con.w == 'pool':
-            self.__class__.con_pool = con
-        self.con = con
+        self.con = self.__class__._con_pool
 
     @staticmethod
     def __filter_dict(orign_data, colns=None, onlyexists=False, defv=None, mode='dict'):
@@ -757,7 +762,7 @@ class Qer(object):
             return nstr[:-1],vstr[:-1]
 
     @staticmethod
-    def __dict2str(self, from_dict, array=None, mode=0):
+    def __dict2str(from_dict, array=None, mode=0):
         if mode == 0:
             vstr = ''
             for _ in array if array else form_dict.iterkeys():
@@ -776,34 +781,47 @@ class Qer(object):
     @staticmethod
     def __dict_list_4json(datalist, fieldlist, one=False):
         """[{key-1-1:val-1-1,key-1-2:val-1-2,...},{key-2-1:val-2-1,key-2-2:val-2-2,...}]"""
-        # datalist: (1,2,3...), ((1,2,3..), (4,5,6...),...)
+        # datalist: (1,2,3...), ((1,2,3..), (4,5,6...),...); v2.1
         if isinstance(fieldlist, str):
             fieldlist = fieldlist.split(',')
         if not datalist or not isinstance(fieldlist, (list,tuple)):
             print 'not a correct input!'
             return None
         slen = len(fieldlist)
-        if not isinstance(datalist[0], tuple):
+        def t2d(t):
+            c = 0
+            d = {}
+            for _ in fieldlist:
+                x = t[c]
+                d[_] = x if isinstance(x, (unicode, str, int)) else str(x)
+                c += 1
+            return d
+        def d2d(D):
+            d = {}
+            for _ in fieldlist:
+                d[_] = D[_]
+            return d
+        def o2d(o):
+            d = {}
+            for _ in fieldlist:
+                d[_] = o.__dict__[_]
+            return d
+        slen = len(fieldlist)
+        if isinstance(datalist[0], (str, unicode, int)):
+            if slen != len(datalist):
+                raise ValueError("length of item miss match!")
             if one:
-                line_dict = dict()
-                for _ in xrange(slen):
-                    line_dict[fieldlist[_]] = datalist[_]
-                return line_dict
+                return t2d(datalist)
             else:
                 datalist = [datalist]
-        if len(datalist[0]) != slen:
-            print 'data not match field: \n%s\n%s' % (str(datalist[0]), str(fieldlist))
-            return {}
         out_list = list()
-        line_dict = dict()
         for line in datalist:
-            c = 0
-            for x in fieldlist:
-                t = line[c] if isinstance(c, dict) else line[c].__dict__
-                line_dict[x] = t if isinstance(t, (unicode, str, int)) else str(t)
-                c += 1
-            out_list.append(line_dict)
-            line_dict = dict()
+            if isinstance(line, tuple):
+                out_list.append(t2d(line))
+            elif isinstance(line, dict) or hasattr(line, '__getitem__'):
+                out_list.append(d2d(line))
+            elif hasattr(line, '__dict__'):
+                out_list.append(o2d(line))
         return out_list
 
 
