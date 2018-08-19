@@ -19,11 +19,11 @@ logging.basicConfig(level=logging.DEBUG, format='(%(funcName)-10s) %(message)s')
 
 class server_info:
     server_info = {
-        'host': '120.77.244.198',
+        'host': '127.0.0.1',
         'port': 3306,
-        'user': 'fd_dbusr',
-        'passwd': 'usrdb32pwd!',
-        'db': 'fddb1',
+        'user': 'dbuser',
+        'password': 'dbpassword',
+        'database': 'dbname',
         'charset': 'utf8'
     }
 
