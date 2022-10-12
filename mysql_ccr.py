@@ -9,24 +9,25 @@ update: com_con,增加flexiable模式的pool
 201803：new arg for execute_db: get_ins_id(false), weather return last insert id
 ==>update: 20210830: [get_item as query with new mysql connection and close soon]
 ==>update: 20220226: 真实的完成了压力测试，基本上算是靠谱可用了。
+==>update: 20220512: 进一步的强化并发稳定性。多线程1000并发0-1s随机时间。7con。flexible
+==>update: 20220727: 简单增加readonly模式。
 """
 import mysql.connector as mcr
-import mysql.connector.pooling as mcrp
 import logging
 import time
+import random
 #   for com_con
-from random import random as rdm
 from threading import Lock
-logging.basicConfig(level=logging.DEBUG, format='(%(funcName)-10s) %(message)s')
+#logging.basicConfig(level=logging.DEBUG, format='(%(funcName)-10s) %(message)s')
 
 
 class server_info:
     server_info = {
-        'host': '120.77.244.198',
+        'host': '127.0.0.1',
         'port': 3306,
-        'user': 'examer',
-        'password': 'exm@runner!',
-        'db': 'exams',
+        'user': 'sqluser',
+        'password': 'sqlpwd',
+        'db': 'sqldb',
         'charset': 'utf8',
         'connection_timeout': 3,
     }
@@ -47,6 +48,10 @@ class server_info:
     def info(self):
         return str(self.D)
 
+"""
+sql_checker:
+"""
+
 
 class com_con(object):
     wait_con_time = 5
@@ -58,33 +63,32 @@ class com_con(object):
     sleeptime = 240
     #   w is a mark for pool
     w = 'pool'
-
-    @classmethod
-    def set_deadlen(cls, dlen=0):
-        if dlen > cls.dead_len:
-            cls.dead_len = dlen
-            return dlen
-        else:
-            return cls.dead_len
+    MODE_FLEXIBLE = 0
+    MODE_LIST = 1
+    sql_checker = None
 
     #   -1: not inited; 1: working; 0:shutdown
-    def __init__(self, poolname, con_info, length=0, atonce=True, flexible=False, debug=False, **kwargs):
+    def __init__(self, poolname, con_info, length=0, atonce=True, flexible=False, debug=False, readonly=False, **kwargs):
         # if flexible, work with lenth and dead_length, and self.c->last time work mode, if add new con is set to 1, if kick set to -1: 
         # when take: if overlen create new con, if over deadlen error
         # when kick: if finger > len and last time is kick, will not append to conlist for reuse, just remove it(on the other hand, if the last time action is still create new con, which means the pool may still works under busy mode)
-        self.length = length or self.__class__.length
+        
+        do_fill = True
+        self.rmode = readonly
         if flexible:
-            if self.length < self.__class__.dead_len:
-                self.dead_len = self.__class__.dead_len
-                self.__take_kick = self.__take_kick_2
-                self.c = 0
-            else:
-                logging.warning('length is bigger than dead_len, will not work in flexible mode!')
-                self.dead_len = 0
-                self.__take_kick = self.__take_kick_1
+            # starts with length==1
+            # length as dead_length
+            self.length = 1
+            self.dead_len = length
+            self.__take_kick = self.__take_kick_2
+            self.c = 0
+            self._mode = 0
+            do_fill = False
         else:
+            self.length = length or self.__class__.length
             self.dead_len = 0
             self.__take_kick = self.__take_kick_1
+            self._mode = 1
         self.cif = con_info if isinstance(con_info, dict) else con_info.D if isinstance(con_info, server_info) else None
         if self.cif is None:
             raise RuntimeError("NO connection info!")
@@ -102,14 +106,14 @@ class com_con(object):
         self.curcon = None
         self.recover_time = self.__class__.recover_time
         # too long no using
-        self.sleeptime = kwargs.get('sleeptime', self.__class__.sleeptime)
-        self.lasttime = time.time()
+        #self.sleeptime = kwargs.get('sleeptime', self.__class__.sleeptime)
+        #self.lasttime = time.time()
         self.w = 'pool'
         if not atonce:
             return
         self.ilock.acquire()
         try:
-            self.__inilist()
+            self.__inilist(do_fill)
         finally:
             self.ilock.release()
     """
@@ -131,18 +135,22 @@ class com_con(object):
         # args: controller:
         # args[0]: one row?
         # args[1]: single column?
-        if not sqlcmd.startswith('SELECT'):
+        if not sqlcmd.upper().startswith('SELECT'):
             return False
+        # sql_checker:
+        # if not self.sql_checker(sqlcmd):
+        #   return False
         con = mcr.connect(**self.cif)
+        cur = con.cursor()
         try:
-            cur.execute(sqcmd)
+            cur.execute(sqlcmd)
             result = cur.fetchall()
+            cur.close()
         except mcr.Error as err:
             #logging.error("sql error: %s: %s" % (err.errno, err.msg))
-            logging.error("sqlcmd error: %s" % cmd)
+            logging.error("sqlcmd error: %s" % sqlcmd)
             return False
         finally:
-            cur.close()
             con.close()
         return result
 
@@ -155,9 +163,8 @@ class com_con(object):
             return False
         return con
 
-    # when use sleep time
     def __takecon(self):
-        t = time.time()
+        #t = time.time()
         con = self.conlist.pop(0)
         try:
             con.ping(reconnect=True, delay=0)
@@ -169,27 +176,46 @@ class com_con(object):
             con.mark = 0
             logging.debug("new con: %s created!" % con.connection_id)
             self.staticlist.append(con)
-        self.lasttime = t
+        #self.lasttime = t
         return con
 
-    # when use sleep time
+    # for flexable
     def __takecon2(self):
-        con = self.conlist.pop(0)
-        if not con.is_connected():
-            logging.error("CON: %s :this con is dead with ping!" % con.connection_id)
-            self.staticlist.remove(con)
+        try:
+            con = self.conlist.pop(0)
+            #print("con from takencon2")
+        except IndexError:
+            con = None
+        if con:
+            if con.is_connected():
+                return con
+            else:
+                #print("con not connected, shutdown!")
+                self.staticlist.remove(con)
+                con.shutdown()
+        for i in range(len(self.conlist)):
+            con = self.conlist.pop(0)
+            if not con.is_connected():
+                logging.error("CON: %s :this con is dead with ping!" % con.connection_id)
+                self.staticlist.remove(con)
+                del con
+            else:
+                #print("con of idx: %d" % i)
+                return con
+        #print("all con clear!")
+        # if no connection available
         try:
             con = mcr.connect(**self.cif)
-            con.mark = 0
             logging.debug("new con: %s created!" % con.connection_id)
             self.staticlist.append(con)
-            self.lasttime = time.time()
+            self.length = len(self.staticlist)
+            #self.lasttime = time.time()
         except:
             con = None
             logging.error("NOT ABLE to Create a new connection!")
         return con
 
-    def __inilist(self):
+    def __inilist(self, fill=True):
         if self.status > 0:
             if self.length > len(self.staticlist):
                 for x in range(self.length - len(self.staticlist)):
@@ -212,24 +238,28 @@ class com_con(object):
         tcon.mark = 0
         self.staticlist[0] = tcon
         self.conlist.append(tcon)
-        for i in range(1, self.length):
-            con = mcr.connect(**self.cif)
-            con.mark = 0
-            self.conlist.append(con)
-            self.staticlist[i] = con
-            time.sleep(0.05)
+        if fill:
+            for i in range(1, self.length):
+                con = mcr.connect(**self.cif)
+                con.mark = 0
+                self.conlist.append(con)
+                self.staticlist[i] = con
+                time.sleep(0.05)
         logging.debug("INITIAL POOL DONE!")
         self.status = 1
         return self.status
 
     def __fix_cons(self, con=None):
         try:
+            cur = None
             checkcon = mcr.connect(**self.cif)
-            cur = checkon.cursor()
+            cur = checkcon.cursor()
             cur.execute("show processlist")
         except:
-            cur.close()
-            checkcon.close()
+            logging.warning("fix con failure!")
+            if cur:
+                cur.close()
+                checkcon.close()
             return False
         dbrt = cur.fetchall()
         if not dbrt:
@@ -288,73 +318,62 @@ class com_con(object):
         return self.finger
 
     def __str__(self):
-        return 'pool status: %s\tfinger: %s\t; usage: %s/%s' % (self.status, self.finger, len(self.conlist), len(self.staticlist))
+        return 'pool status: %d\tfinger: %d\t; usage: %d/%d' % (self.status, self.finger, len(self.conlist), len(self.staticlist))
 
     __repr__ = __str__
 
     def __take_kick_2(self, con=None):
         # works for flexable mode
-        if self.debug:
-            logging.debug('con_pool=>status: %s\tfinger: %s\t; usage: %s/%s' % (self.status, self.finger, len(self.conlist), len(self.staticlist)))
-        #   work on flexible mode
-        def newcon():
-            ncon = mcr.connect(**self.cif)
-            if ncon:
-                # create con and direct use, so it's no need to append to conlist
-                self.staticlist.append(ncon)
-                self.finger += 1
-                self.c = 1
-                return ncon
-            else:
-                return None
-
-        if self.aqrs == 1:
-            time.sleep(3)
-            self.ilock.release()
-        if not self.ilock.acquire(timeout=5):
-            return None
-        self.aqrs = 1
+        # 10个并发threading-产生4个con
+        # 100个并发threading-产生6个con
+        # 待升级：con的回收机制:
+        # 1) 内部-定时测试-回收
+        # 2）内部-定量（使用量）测试-回收
+        # 3）外部-定时回收
         if con:
-            if self.finger > self.length and self.c < 0:
+            if self.debug:
+                logging.debug('release con: finger:%d\t; usage: %d/%d;' % (self.finger, len(self.conlist), len(self.staticlist)))
+            if self.finger > self.dead_len:
+                con.close()
                 self.staticlist.remove(con)
                 del con
             else:
                 self.conlist.append(con)
-                con.mark = 0
-            self.c = -1
             self.finger -= 1
             return self.finger
-        if self.status == 0:
-            if self.__inilist() != 1:
+        if self.debug:
+            logging.debug('con_pool=>status: %d\tfinger: %d\t; usage: %d/%d' % (self.status, self.finger, len(self.conlist), len(self.staticlist)))
+        # currently no use
+        if self.aqrs == 1:
+            time.sleep(3)
+            if self.ilock.locked():
                 self.ilock.release()
-                self.aqrs = 0
-                raise RuntimeError('Cannot Initial the Pool!')
-        elif self.status == -1:
-            self.conlist = []
-            self.staticlist = []
-            con = newcon()
-            self.ilock.release()
             self.aqrs = 0
-            if con:
-                self.status = 1
-                return con
-            else:
-                return RuntimeError('Not able to inital the pool!')
-        if self.finger >= self.dead_len:
-            if self.__batch_recovery() >= self.dead_len:
-                self.ilock.release()
-                self.aqrs = 0
-                raise RuntimeError('Work on flexible Mode and over dead_len!')
-        elif self.finger >= self.length:
-            con = newcon()
-            self.ilock.release()
-            self.aqrs = 0
-            return con
-        con = self.__takecon()
-        self.finger += 1
-        self.c = 1
-        self.aqrs = 0
+            return None
+
+        if self.status <= 0:
+            try:
+                rt = self.__inilist(False)
+                if rt != 1:
+                    self.aqrs = 0
+                    return None
+                self.length = 1
+            except:
+                return None
+        for i in range(10):
+            if self.ilock.acquire(timeout=3):
+                break
+            time.sleep(random.random())
+            if i == 9:
+                logging.error("begin with kicktake: ilock not get!")
+                return None
+        con = self.__takecon2()
         self.ilock.release()
+        if not con:
+            return None
+        self.finger += 1
+        # mark time for analyzation or sysgard
+        con.tmark = time.time()
         return con
 
     def __take_kick_1(self, con=None):
@@ -364,8 +383,8 @@ class com_con(object):
             self.finger -= 1
             #logging.debug("release con: %s" % str(self))
             return self.finger
-        if self.debug:
-            logging.debug('conpool=>status: %s\tfinger: %s\t; usage: %s/%s' % (self.status, self.finger, len(self.conlist), len(self.staticlist)))
+        #if self.debug:
+        #    logging.debug('conpool=>status: %s\tfinger: %s\t; usage: %s/%s' % (self.status, self.finger, len(self.conlist), len(self.staticlist)))
         if not self.ilock.acquire(timeout=5):
             logging.error("begin with kicktake: ilock not get!")
             return None
@@ -407,7 +426,8 @@ class com_con(object):
                     con = self.__takecon()
                     break
             # length==2 会导致出错
-            if self.length>10 and self.finger>=self.length-1:
+            #if self.length>10 and self.finger>=self.length-1:
+            if self.finger>self.length:
                 if not self.ilock.locked():
                     logging.warning("try to fix cons but not get lock.")
                     return None
@@ -453,12 +473,12 @@ class com_con(object):
         logging.warning("shutting down com_con instance!")
         for _ in range(len(self.staticlist)):
             con = self.staticlist.pop()
-            print(f"con {con.connection_id} to close.")
-            con.close()
+            logging.info(f"con {con.connection_id} to shutdown.")
+            con.shutdown()
             time.sleep(0.05)
-        if self.curcon:
-            print(f"con {self.curcon.connection_id} to close.")
-            self.curcon.close()
+        if self.curcon and self.curcon.ready and self.curcon>=0:
+            logging(f"con {self.curcon.connection_id} to shutdown.")
+            self.curcon.shutdown()
         self.status = 0
         self.ilock.release()
 
@@ -481,12 +501,17 @@ class com_con(object):
             return self.__batch_recovery()
 
     def execute_db(self, cmd, get_ins_id=False):
+        # waiting for sql_checker:
+        if self.rmode:
+            logging.warning("read only mode!")
+            return False
         con = self.__take_kick()
         if con is None:
             logging.warning("no connection taken!")
             return None
         if self.debug:
             logging.debug(cmd)
+        rt = None
         try:
             cur = con.cursor()
             cur.execute(cmd)
@@ -509,6 +534,10 @@ class com_con(object):
         return rt
 
     def us_execute_db(self, sqlcmd):
+        if self.rmode:
+            logging.warning("read only mode!")
+            return False
+        # sql_checker:
         con = self.__take_kick()
         if con is None:
             logging.warning("no connection taken!")
@@ -531,11 +560,13 @@ class com_con(object):
         return rt
 
     def query_db(self, cmd, one=False, single=False, raw=False):
+        # sql_checker:
         # @one: is one row?
         # @single: is single column per row?
         # @raw: no auto convert, just bytearray...
         # raw: list of list of bytearray like: (bytearray(b'159'), bytearray(b'170'), bytearray(b'0'), bytearray(b'0'), bytearray(b'1'), bytearray(b'4'), bytearray(b'0')
         con = self.__take_kick()
+        rt = None
         if con is None:
             logging.warning("no connection taken!")
             return None
@@ -552,7 +583,7 @@ class com_con(object):
                 con = self.resetcon(con)
                 if con is None:
                     return False
-            elif cur.rowcount:
+            elif cur.rowcount>0:
                 cur.fetchall()
                 cur.close()
             self.__take_kick(con)
@@ -573,6 +604,10 @@ class com_con(object):
         return rt
 
     def do_sequence(self, sql_seq, ignore=True, results=False):
+        # readonly 不支持序列
+        if self.rmode:
+            logging.warning("read only mode!")
+            return False
         # execute(,mulit=True)在碰到中途问题语句时执行不完整
         con = self.__take_kick()
         cur = con.cursor()
@@ -603,114 +638,6 @@ class com_con(object):
         self.__take_kick(con)
         return dbrt_count
     # if transaction... use with and con autocommit switch
-
-class com_con2(object):
-    w = 'pool'
-    length = 10
-
-    def __init__(self, poolname, server_args, length=0, **extargs):
-        self.server = server_args if isinstance(server_args, dict) else server_args.D if isinstance(server_args, server_info) else None
-        assert self.server
-        self.pool = mcrp.MySQLConnectionPool(pool_name=poolname, pool_size=length or self.__class__.size, **self.server)
-        if not self.pool:
-            raise RuntimeError("Not Able to Create a connect pool for mysql!")
-        self.lastcmd = ''
-        self.curcon = None
-
-    def __getitem__(self, cmds):
-        if isinstance(cmds, str):
-            operation = cmds.split(' ')[0]
-            if operation.lower() in ('insert', 'update', 'delete'):
-                return self.execute_db(cmds)
-            else:
-                rt = self.query_db(cmds)
-                return rt[0] if rt and len(rt) == 1 else rt
-        else:
-            return self.execute_dbs(cmds)
-
-    def shutdown(self):
-        return True
-
-    def reset(self, server_args):
-        self.server = server_args
-        self.pool.set_config(**server)
-
-    def free(self):
-        con = self.pool.get_connection()
-        return con if con.is_connected() else None
-
-    def release(self, con=None):
-        return True
-
-    def __enter__(self):
-        self.elock.acquire()
-        if self.curcon is None:
-            logging.info('con for with is still None, create it!')
-            self.curcon = self.pool.get_connection()
-        return self.curcon
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.curcon.close()
-        self.elock.release()
-
-    def execute_db(self, cmd, get_ins_id=False):
-        con = self.pool.get_connection()
-        if con:
-            cur = con.cursor()
-            cur.execute(cmd)
-            if cur.fetchone() and get_ins_id:
-                cur.execute('SELECT LAST_INSERT_ID;')
-                rt = cur.fetchone()[0]
-            else:
-                rt = True
-            cur.close()
-            con.close()
-            return rt
-        raise RuntimeError('NO connection to take, with current finger=%s' % self.finger)
-
-    def execute_dbs(self, cmds):
-        cmdstr = ';'.join(cmds) if isinstance(cmds, (tuple, list)) else cmds
-        con = self.pool.get_connection()
-        cur = con.cursor(multi=True)
-        dbrt = []
-        for result in cur.execute(operation, multi=True):
-            if result.with_rows:
-                dbrt.append(result.fetchall())
-            else:
-                dbrt.append(result.rowcount)
-        cur.close()
-        con.close()
-        return dbrt
-
-    def us_execute_db(self, sqlcmd):
-        con = self.pool.get_connection()
-        if con:
-            cur = con.cursor()
-            cur.execute('SET SQL_SAFE_UPDATES=0;')
-            cur.execute(cmd)
-            if cur.fetchone() and get_ins_id:
-                cur.execute('SELECT LAST_INSERT_ID;')
-                rt = cur.fetchone()[0]
-            cur.execute('SET SQL_SAFE_UPDATES=0;')
-            cur.close()
-            con.close()
-            return rt
-        raise RuntimeError('NO connection to take')     
-
-    def query_db(self, cmd, one=False):
-        con = self.pool.get_connection()
-        if con:
-            cur = con.cursor()
-            cur.execute(cmd)
-            if one:
-                rt = cur.fetchone()[0]
-            else:
-                rt = cur.fetchall()
-            cur.close()
-            con.close()
-            return rt
-        raise RuntimeError('NO connection to take')
-
 
 class rwcon(com_con):
 
@@ -747,9 +674,11 @@ class rwcon(com_con):
 
 if __name__ == '__main__':
     #server = server_info().D
-    server = {'host': 'localhost', 'user': 'test1', 'db':'exams', 'password': '123456'}
+    server = {'host': 'localhost', 'user': 'root', 'db':'x', 'password': 'x'}
+    print(server)
     testpool = com_con('testing', server, length=3)
-    dbrt = testpool['select * from user']
+    print(testpool)
+    dbrt = testpool['select * from mysql.user']
     print(dbrt)
     # testdbc = mdb_mysql(server)
     # if testdbc.connect_db() == 1:
